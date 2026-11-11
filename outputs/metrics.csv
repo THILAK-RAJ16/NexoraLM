@@ -1,0 +1,2 @@
+epoch,train_loss,val_loss,learning_rate,epoch_duration_sec,best_val_loss
+3,3.214484,3.169926,0.000285,0.75,3.169926
