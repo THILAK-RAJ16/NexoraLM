@@ -59,8 +59,10 @@ class ScaledDotProductAttention(nn.Module):
         scores = torch.matmul(query, key.transpose(-2, -1)) * scale
 
         if mask is not None:
-            # Mask out positions where mask is False/0 by setting score to -inf (-1e9 for numerical stability)
-            scores = scores.masked_fill(mask == 0, float("-1e9"))
+            # Mask out positions where mask is False/0 by setting score to min finite value for scores.dtype
+            # Using torch.finfo(scores.dtype).min avoids float16/c10::Half overflow under Mixed Precision (AMP)
+            mask_value = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(mask == 0, mask_value)
 
         # Compute attention probabilities
         attn_weights = F.softmax(scores, dim=-1)

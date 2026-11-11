@@ -116,3 +116,91 @@ def test_mha_gradient_propagation():
     assert mha.qkv_projection.weight.grad is not None
     assert mha.out_projection.weight.grad is not None
 
+
+def test_attention_float32():
+    """Verify ScaledDotProductAttention and CausalMultiHeadAttention under standard float32."""
+    attn = ScaledDotProductAttention(dropout=0.0)
+    q = torch.randn(2, 4, 8, 16, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(2, 4, 8, 16, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(2, 4, 8, 16, dtype=torch.float32, requires_grad=True)
+    mask = torch.tril(torch.ones(8, 8, dtype=torch.bool)).view(1, 1, 8, 8)
+
+    out, weights = attn(q, k, v, mask=mask, return_attention_weights=True)
+    assert out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(weights).all()
+
+    # Verify backward pass produces finite gradients
+    loss = out.sum()
+    loss.backward()
+    assert torch.isfinite(q.grad).all()
+    assert torch.isfinite(k.grad).all()
+    assert torch.isfinite(v.grad).all()
+
+
+def test_attention_float16_no_overflow():
+    """
+    Verify ScaledDotProductAttention and CausalMultiHeadAttention under torch.float16 (Half).
+    Prevents 'RuntimeError: value cannot be converted to type c10::Half without overflow'.
+    """
+    attn = ScaledDotProductAttention(dropout=0.0)
+    q = torch.randn(2, 4, 8, 16, dtype=torch.float16, requires_grad=True)
+    k = torch.randn(2, 4, 8, 16, dtype=torch.float16, requires_grad=True)
+    v = torch.randn(2, 4, 8, 16, dtype=torch.float16, requires_grad=True)
+    mask = torch.tril(torch.ones(8, 8, dtype=torch.bool)).view(1, 1, 8, 8)
+
+    # Must execute without overflow error
+    out, weights = attn(q, k, v, mask=mask, return_attention_weights=True)
+    assert out.dtype == torch.float16
+    assert torch.isfinite(out).all()
+    assert torch.isfinite(weights).all()
+
+    # Verify strictly 0 attention weights for masked future positions (j > i)
+    for i in range(8):
+        for j in range(8):
+            if j > i:
+                assert weights[:, :, i, j].max().item() == 0.0
+
+    # Verify finite gradients in float16
+    loss = out.sum()
+    loss.backward()
+    assert torch.isfinite(q.grad).all()
+    assert torch.isfinite(k.grad).all()
+    assert torch.isfinite(v.grad).all()
+
+    # Test full CausalMultiHeadAttention module with float16
+    cfg = ModelConfig(vocab_size=69, embed_dim=64, num_heads=4, context_length=32, dropout=0.0)
+    mha = CausalMultiHeadAttention(cfg).to(dtype=torch.float16)
+    x = torch.randn(2, 12, 64, dtype=torch.float16, requires_grad=True)
+    mha_out, mha_weights = mha(x, return_attention_weights=True)
+    assert mha_out.dtype == torch.float16
+    assert torch.isfinite(mha_out).all()
+    mha_loss = mha_out.sum()
+    mha_loss.backward()
+    assert torch.isfinite(x.grad).all()
+
+
+def test_attention_cuda_autocast_when_available():
+    """
+    Verify ScaledDotProductAttention and CausalMultiHeadAttention under torch.autocast on CUDA.
+    If CUDA is not available, verify the test reports skip safely.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device not available in current environment; skipping CUDA autocast test.")
+
+    cfg = ModelConfig(vocab_size=69, embed_dim=64, num_heads=4, context_length=32, dropout=0.0)
+    mha = CausalMultiHeadAttention(cfg).cuda()
+    x = torch.randn(2, 16, 64, device="cuda", requires_grad=True)
+
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+        out, weights = mha(x, return_attention_weights=True)
+        assert torch.isfinite(out).all()
+        assert torch.isfinite(weights).all()
+        loss = out.sum()
+
+    scaler = torch.amp.GradScaler("cuda")
+    scaler.scale(loss).backward()
+    scaler.step(torch.optim.AdamW(mha.parameters()))
+    scaler.update()
+    assert torch.isfinite(x.grad).all()
+
